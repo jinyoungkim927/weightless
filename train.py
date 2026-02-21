@@ -13,7 +13,6 @@ GPU_PEAK_TFLOPS = 990
 
 from data import get_dataloader
 from model import create_model
-from metric import print_profile
 
 PAD_TOKEN_ID = 50256  # GPT-2 <|endoftext|> used as pad token
 GOAL_VAL_LOSS = 3.5
@@ -292,20 +291,11 @@ def main():
         print(f"  Total parameters:    {total_params:,}")
         print(f"  Non-zero parameters: {nonzero_params:,}")
 
-        # Show the bytes_per_token_infer breakdown
-        profile = raw_model.get_inference_profile()
-        print_profile(profile)
-
         if use_wandb:
             import wandb
-            bd = profile.breakdown_dict()
             wandb.log({
                 "params/total": total_params,
                 "params/nonzero": nonzero_params,
-                "metric/bytes_per_token_infer": profile.total_bytes,
-                **{f"metric/{k}": v for k, v in bd.items()},
-                "metric/unique_param_bytes": profile.unique_param_bytes,
-                "metric/unique_opt_state_bytes": profile.unique_opt_state_bytes,
             })
 
     # Optimizer
@@ -336,13 +326,10 @@ def main():
         if hasattr(raw_model_final, "_orig_mod"):
             raw_model_final = raw_model_final._orig_mod
         final_val_loss = evaluate(model, val_loader, device)
-        profile = raw_model_final.get_inference_profile()
         print("\n" + "=" * 60)
         print("  TRAINING COMPLETE")
         print("=" * 60)
         print(f"  Final val_loss:         {final_val_loss:.4f}  (target < {GOAL_VAL_LOSS})")
-        print(f"  bytes_per_token_infer:  {profile.total_bytes:,} bytes")
-        print_profile(profile)
         if final_val_loss < GOAL_VAL_LOSS:
             print(f"  GOAL ACHIEVED!")
         else:

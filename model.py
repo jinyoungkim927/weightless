@@ -1,6 +1,6 @@
 """Starter model for the FineWeb challenge.
 
-Your goal: achieve val loss < 3.3 with the lowest bytes_per_token_infer score.
+Your goal: achieve val loss < 3.3 with the most efficient model possible.
 Modify this model architecture to be as sparse/efficient as possible.
 
 Two variants are provided:
@@ -13,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from rope import RotaryPositionalEmbedding
-from metric import InferenceProfile
 
 # GPT-2 tokenizer vocab size
 VOCAB_SIZE = 50257
@@ -28,7 +27,7 @@ class SimpleTransformer(nn.Module):
     """A minimal transformer for language modeling.
     
     This is a basic starter -- you should modify/replace this
-    to minimize bytes_per_token_infer while achieving val loss < 3.3.
+    to maximize efficiency while achieving val loss < 3.3.
     """
     
     def __init__(
@@ -125,102 +124,6 @@ class SimpleTransformer(nn.Module):
         else:
             return sum((p != 0).sum().item() for p in self.parameters())
 
-    def get_inference_profile(
-        self,
-        seq_len: int = 512,
-        weight_dtype_bytes: float = 2,
-        kv_dtype_bytes: float = 2,
-        count_reuse: bool = False,
-    ) -> InferenceProfile:
-        """Compute bytes_per_token_infer breakdown for single-token decode.
-
-        Candidates: update this method when you change the architecture so
-        the metric accurately reflects your design.
-
-        Args:
-            weight_dtype_bytes: bytes per weight element (2=bf16, 1=fp8, 0.5=4-bit)
-            kv_dtype_bytes: bytes per KV cache element
-        """
-        d = self.d_model
-        h = self.n_heads
-        kv_h = self.n_kv_heads
-        hd = self.head_dim
-        L = self.n_layers
-        V = self.vocab_size
-        wb = weight_dtype_bytes
-        kb = kv_dtype_bytes
-
-        # LM head: logits = hidden @ W.T reads the FULL vocab x d_model matrix
-        # This is always a full-matrix read regardless of weight tying.
-        lm_head_bytes = V * d * wb
-
-        # Embedding: lookup one row (d_model bytes).
-        # When tied with lm_head, that one row is a subset of the full-matrix
-        # read above, so with count_reuse=False we don't double-count it.
-        if self.weight_tied and not count_reuse:
-            embedding_bytes = 0  # subsumed by lm_head full-matrix read
-        else:
-            embedding_bytes = d * wb
-
-        # Attention projections per layer (all layers summed)
-        # Q: d_model -> n_heads * head_dim = d_model
-        attn_q_bytes = L * d * (h * hd) * wb
-        # K: d_model -> n_kv_heads * head_dim
-        attn_k_bytes = L * d * (kv_h * hd) * wb
-        # V: same as K
-        attn_v_bytes = L * d * (kv_h * hd) * wb
-        # O: n_heads * head_dim -> d_model
-        attn_o_bytes = L * (h * hd) * d * wb
-
-        # FFN per layer (SwiGLU: w1, w3 are d->d_ff, w2 is d_ff->d)
-        ffn_bytes = L * (
-            d * self.d_ff  # w1
-            + self.d_ff * d  # w2
-            + d * self.d_ff  # w3
-        ) * wb
-
-        # Norms: 2 per layer (ln1, ln2) + 1 final (ln_f), each has gamma+beta
-        norm_bytes = (2 * L + 1) * 2 * d * wb
-
-        # KV cache
-        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
-        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
-
-        # Unique parameters
-        seen_ptrs: set[int] = set()
-        unique_numel = 0
-        for p in self.parameters():
-            ptr = p.data_ptr()
-            if ptr not in seen_ptrs:
-                seen_ptrs.add(ptr)
-                unique_numel += p.numel()
-
-        return InferenceProfile(
-            model_name="baseline",
-            d_model=d,
-            n_layers=L,
-            n_heads=h,
-            n_kv_heads=kv_h,
-            head_dim=hd,
-            d_ff=self.d_ff,
-            vocab_size=V,
-            seq_len=seq_len,
-            weight_dtype_bytes=wb,
-            kv_dtype_bytes=kb,
-            count_reuse=count_reuse,
-            embedding_bytes=embedding_bytes,
-            attn_q_bytes=attn_q_bytes,
-            attn_k_bytes=attn_k_bytes,
-            attn_v_bytes=attn_v_bytes,
-            attn_o_bytes=attn_o_bytes,
-            ffn_bytes=ffn_bytes,
-            norm_bytes=norm_bytes,
-            lm_head_bytes=lm_head_bytes,
-            kv_cache_read_bytes=kv_cache_read_bytes,
-            kv_cache_write_bytes=kv_cache_write_bytes,
-            unique_param_bytes=unique_numel * wb,
-            unique_opt_state_bytes=unique_numel * 12,
-        )
 
 
 # ============================================================================
@@ -307,8 +210,7 @@ class TopKSwiGLUFF(nn.Module):
 
     After computing the gate activations (w1, w3), only the top-k
     neurons are kept.  During inference this means only k rows of w2
-    need to be read from memory (instead of all d_ff rows), reducing
-    bytes_per_token_infer for the FFN component.
+    need to be read from memory (instead of all d_ff rows).
 
     Training uses the full d_ff (via straight-through or just dense)
     to keep gradients flowing; the top-k mask is applied to the
@@ -370,14 +272,12 @@ class TransformerBlock(nn.Module):
 # ============================================================================
 
 class BaselinePlusTransformer(SimpleTransformer):
-    """Baseline with two clear optimizations that reduce bytes_per_token_infer:
+    """Baseline with two clear optimizations for efficiency:
 
     1. Grouped Query Attention (GQA):  n_kv_heads < n_heads
        -> fewer KV projection weights, smaller KV cache
     2. Top-k FFN activation sparsity:  only top-k neurons of w1/w3 gate
        -> only k rows of w2 read during inference
-
-    These produce a visually obvious improvement in the metric breakdown.
     """
 
     def __init__(
@@ -427,85 +327,6 @@ class BaselinePlusTransformer(SimpleTransformer):
 
         self._init_weights(n_layers)
 
-    def get_inference_profile(
-        self,
-        seq_len: int = 512,
-        weight_dtype_bytes: float = 2,
-        kv_dtype_bytes: float = 2,
-        count_reuse: bool = False,
-    ) -> InferenceProfile:
-        """Compute bytes_per_token_infer for baseline+ (GQA + top-k FFN)."""
-        d = self.d_model
-        h = self.n_heads
-        kv_h = self.n_kv_heads
-        hd = self.head_dim
-        L = self.n_layers
-        V = self.vocab_size
-        wb = weight_dtype_bytes
-        kb = kv_dtype_bytes
-        k = self.ffn_top_k
-
-        # LM head always reads the full vocab x d_model matrix
-        lm_head_bytes = V * d * wb
-
-        # Embedding: 1 row, subsumed by lm_head when tied
-        if self.weight_tied and not count_reuse:
-            embedding_bytes = 0
-        else:
-            embedding_bytes = d * wb
-
-        attn_q_bytes = L * d * (h * hd) * wb
-        attn_k_bytes = L * d * (kv_h * hd) * wb
-        attn_v_bytes = L * d * (kv_h * hd) * wb
-        attn_o_bytes = L * (h * hd) * d * wb
-
-        # FFN with top-k: w1 and w3 are read fully, w2 only top-k rows
-        ffn_bytes = L * (
-            d * self.d_ff  # w1 (full)
-            + k * d        # w2 (only k rows read)
-            + d * self.d_ff  # w3 (full)
-        ) * wb
-
-        norm_bytes = (2 * L + 1) * 2 * d * wb
-
-        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
-        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
-
-        seen_ptrs: set[int] = set()
-        unique_numel = 0
-        for p in self.parameters():
-            ptr = p.data_ptr()
-            if ptr not in seen_ptrs:
-                seen_ptrs.add(ptr)
-                unique_numel += p.numel()
-
-        return InferenceProfile(
-            model_name="baseline_plus",
-            d_model=d,
-            n_layers=L,
-            n_heads=h,
-            n_kv_heads=kv_h,
-            head_dim=hd,
-            d_ff=self.d_ff,
-            vocab_size=V,
-            seq_len=seq_len,
-            weight_dtype_bytes=wb,
-            kv_dtype_bytes=kb,
-            count_reuse=count_reuse,
-            embedding_bytes=embedding_bytes,
-            attn_q_bytes=attn_q_bytes,
-            attn_k_bytes=attn_k_bytes,
-            attn_v_bytes=attn_v_bytes,
-            attn_o_bytes=attn_o_bytes,
-            ffn_bytes=ffn_bytes,
-            norm_bytes=norm_bytes,
-            lm_head_bytes=lm_head_bytes,
-            kv_cache_read_bytes=kv_cache_read_bytes,
-            kv_cache_write_bytes=kv_cache_write_bytes,
-            unique_param_bytes=unique_numel * wb,
-            unique_opt_state_bytes=unique_numel * 12,
-            notes=f"GQA n_kv_heads={kv_h}, top-k FFN k={k}/{self.d_ff}",
-        )
 
 
 # ============================================================================
@@ -526,8 +347,6 @@ def create_model(variant: str = "baseline", **kwargs):
 
 
 if __name__ == "__main__":
-    from metric import print_profile
-
     for variant in ["baseline", "baseline_plus"]:
         print(f"\n{'='*60}")
         print(f"  {variant}")
@@ -537,5 +356,3 @@ if __name__ == "__main__":
         nonzero_params = model.count_parameters(count_zeros=False)
         print(f"  Total parameters:    {total_params:,}")
         print(f"  Non-zero parameters: {nonzero_params:,}")
-        profile = model.get_inference_profile()
-        print_profile(profile)

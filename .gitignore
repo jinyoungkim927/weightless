@@ -52,3 +52,9 @@ Thumbs.db
 .env.*
 *.png
 .venv/
+
+# Gradio
+.gradio/
+
+# Story QA data (large)
+story_qa_v4_plaintext_shards/*.zip

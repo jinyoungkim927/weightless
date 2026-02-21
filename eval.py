@@ -3,7 +3,7 @@
 Usage:
     python eval.py                                      # evaluate random-init baseline (quick check)
     python eval.py --checkpoint model.pt                # evaluate a saved checkpoint
-    python eval.py --checkpoint model.pt --visualize    # + save breakdown chart
+    python eval.py --checkpoint model.pt
 """
 
 import argparse
@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from data import get_dataloader
 from model import create_model
-from metric import print_profile
 
 GOAL_VAL_LOSS = 3.5
 
@@ -80,10 +79,7 @@ def main():
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
-    parser.add_argument("--seq_len", type=int, default=512,
-                        help="Context length for bytes_per_token_infer metric")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Save a breakdown chart as PNG")
+    parser.add_argument("--seq_len", type=int, default=512)
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -127,25 +123,13 @@ def main():
     print(f"  Sparsity:           {metrics['sparsity']:.2%}")
     print(f"  Evaluated Tokens:   {metrics['n_tokens']:,}")
     
-    # bytes_per_token_infer breakdown
-    profile = model.get_inference_profile(seq_len=args.seq_len)
-    print_profile(profile)
-    
     # Goal check
     print("=" * 60)
     if metrics['val_loss'] < GOAL_VAL_LOSS:
         print(f"  GOAL ACHIEVED: val_loss={metrics['val_loss']:.4f} < {GOAL_VAL_LOSS}")
-        print(f"  bytes_per_token_infer = {profile.total_bytes:,} bytes")
     else:
         print(f"  Goal not yet achieved: val_loss={metrics['val_loss']:.4f} >= {GOAL_VAL_LOSS}")
     print("=" * 60)
-    
-    # Optional visualization
-    if args.visualize:
-        from visualize import plot_breakdown
-        out_path = "eval_breakdown.png"
-        plot_breakdown(profile, save_path=out_path)
-        print(f"  Breakdown chart saved to {out_path}")
     
     return metrics
 

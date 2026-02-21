@@ -1,0 +1,8 @@
+Story QA plaintext export
+dataset: year1-story-qa
+train_version: v4
+test_version: v4_eval
+train_docs: 100000
+test_docs: 2048
+train_shards: 10
+test_shards: 1
