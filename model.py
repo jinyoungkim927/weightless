@@ -330,6 +330,85 @@ class BaselinePlusTransformer(SimpleTransformer):
 
 
 # ============================================================================
+# Copy Gate
+# ============================================================================
+
+class CopyGate(nn.Module):
+    """Learnable gate that decides per-position how much to copy from input.
+
+    Parameters: d_model weights + 1 bias = 769 for d_model=768.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.linear = nn.Linear(d_model, 1)
+        # Initialize bias negative so p_copy starts near 0 (generation-dominant)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.constant_(self.linear.bias, -3.0)
+
+    def forward(self, h):
+        """Returns p_copy in [0, 1] for each position. Shape: (B, T, 1)."""
+        return torch.sigmoid(self.linear(h))
+
+
+class CopyGateTransformer(SimpleTransformer):
+    """SimpleTransformer with a learnable copy gate mechanism.
+
+    Adds a small gate (769 params for d_model=768) that blends between
+    the LM head's generation distribution and a copy distribution formed
+    by attending over input token positions and scattering into vocab space.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.copy_gate = CopyGate(self.d_model)
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        x = self.token_emb(input_ids)
+        x = self.dropout(x)
+
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+
+        x = self.ln_f(x)
+
+        # Generation logits from LM head
+        gen_logits = self.head(x)  # (B, T, vocab_size)
+
+        # Copy gate probability
+        p_copy = self.copy_gate(x)  # (B, T, 1)
+
+        # Copy distribution: dot-product attention over input embeddings
+        emb = self.token_emb(input_ids)  # (B, T, d_model)
+        copy_scores = torch.bmm(x, emb.transpose(1, 2))  # (B, T, T)
+        copy_scores = copy_scores / (self.d_model ** 0.5)
+        copy_scores.masked_fill_(causal_mask.unsqueeze(0), float('-inf'))
+        copy_attn = F.softmax(copy_scores, dim=-1)  # (B, T, T)
+
+        # Scatter copy attention into vocab space
+        copy_probs = torch.zeros_like(gen_logits)
+        copy_probs.scatter_add_(
+            2,
+            input_ids.unsqueeze(1).expand(-1, T, -1),
+            copy_attn,
+        )
+
+        # Blend generation and copy distributions
+        gen_probs = F.softmax(gen_logits, dim=-1)
+        blended = (1 - p_copy) * gen_probs + p_copy * copy_probs
+
+        # Return log-probs (compatible with cross_entropy: CE(log(p), y) = -log(p_y))
+        return torch.log(blended + 1e-10)
+
+
+# ============================================================================
 # Factory
 # ============================================================================
 
@@ -337,11 +416,13 @@ def create_model(variant: str = "baseline", **kwargs):
     """Factory function to create a model.
 
     Args:
-        variant: "baseline" or "baseline_plus"
+        variant: "baseline", "baseline_plus", or "copy_gate"
         **kwargs: passed to the model constructor
     """
     if variant == "baseline_plus":
         return BaselinePlusTransformer(**kwargs)
+    elif variant == "copy_gate":
+        return CopyGateTransformer(**kwargs)
     else:
         return SimpleTransformer(**kwargs)
 

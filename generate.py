@@ -1032,7 +1032,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to .pt checkpoint")
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "baseline_plus"])
+                        choices=["baseline", "baseline_plus", "copy_gate"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -1067,8 +1067,9 @@ def main():
 
     if ckpt and os.path.exists(ckpt):
         sd = torch.load(ckpt, map_location=device, weights_only=True)
-        model.load_state_dict(sd)
-        print(f"  ✓ Loaded checkpoint: {ckpt}")
+        strict = (args.model != "copy_gate")
+        model.load_state_dict(sd, strict=strict)
+        print(f"  ✓ Loaded checkpoint: {ckpt} (strict={strict})")
     else:
         print("  ⚠ No checkpoint found — using random-init model.")
 
