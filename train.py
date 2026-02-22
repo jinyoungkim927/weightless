@@ -56,6 +56,81 @@ def get_rank(use_ddp: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer setup
+# ---------------------------------------------------------------------------
+
+def setup_optimizer(model, args, use_ddp=False):
+    """Set up MuonAdamW or AdamW optimizer with proper param grouping."""
+    if not args.use_muon:
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=args.max_lr,
+            betas=(0.9, 0.95),
+            weight_decay=0.3,
+        )
+
+    from muon_optim import MuonAdamW
+
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+
+    # LR scaling: (d_model/768)^-0.5
+    lr_scale = (raw_model.d_model / 768) ** -0.5
+
+    # Classify parameters
+    embedding_params = []
+    muon_params_by_shape = {}  # shape -> list of params
+    skip_names = set()
+
+    # Identify weight-tied lm_head
+    if hasattr(raw_model, 'weight_tied') and raw_model.weight_tied:
+        skip_names.add('head.weight')
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in skip_names:
+            continue
+        if 'token_emb' in name:
+            embedding_params.append(param)
+        elif param.ndim == 2:
+            shape = param.shape
+            if shape not in muon_params_by_shape:
+                muon_params_by_shape[shape] = []
+            muon_params_by_shape[shape].append(param)
+        else:
+            embedding_params.append(param)  # 1D params (layernorm etc) go to AdamW
+
+    param_groups = []
+
+    # Embedding / scalar params -> AdamW
+    if embedding_params:
+        param_groups.append({
+            'params': embedding_params,
+            'kind': 'adamw',
+            'lr': args.embedding_lr * lr_scale,
+            'betas': (0.9, 0.95),
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Matrix params -> Muon (one group per shape for stacking)
+    for shape, params in muon_params_by_shape.items():
+        param_groups.append({
+            'params': params,
+            'kind': 'muon',
+            'lr': args.matrix_lr * lr_scale,
+            'momentum': 0.85,
+            'ns_steps': 5,
+            'beta2': 0.7,
+            'weight_decay': args.muon_wd,
+        })
+
+    return MuonAdamW(param_groups)
+
+
+# ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
@@ -76,11 +151,35 @@ def compute_loss(model, batch, device):
 
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
-    """Linear warmup then linear decay."""
+    """Linear warmup then linear decay (used when use_muon=False)."""
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
     decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
     return max_lr - (max_lr - min_lr) * decay_ratio
+
+
+def get_lr_multiplier(step: int, total_steps: int) -> float:
+    """Warmup (2%) -> constant (48%) -> warmdown (50%, linear to 0)."""
+    warmup_steps = round(0.02 * total_steps)
+    warmdown_steps = round(0.50 * total_steps)
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    elif step <= total_steps - warmdown_steps:
+        return 1.0
+    else:
+        progress = (total_steps - step) / warmdown_steps
+        return progress
+
+
+def get_muon_momentum(step: int) -> float:
+    """Momentum warmup: 0.85 -> 0.95 over first 300 steps."""
+    frac = min(step / 300, 1.0)
+    return (1 - frac) * 0.85 + frac * 0.95
+
+
+def get_weight_decay(step: int, base_wd: float, total_steps: int) -> float:
+    """Linear decay of weight decay to 0 over training."""
+    return base_wd * (1 - step / total_steps)
 
 
 @torch.no_grad()
@@ -117,12 +216,19 @@ def train(
     warmup_steps: int = 200,
     use_wandb: bool = True,
     use_ddp: bool = False,
+    use_muon: bool = True,
+    muon_wd: float = 0.02,
 ):
     """Main training loop with logging every eval_every steps."""
     model.train()
     raw_model = model.module if hasattr(model, "module") else model
     num_params = raw_model.count_parameters(count_zeros=True)
     min_lr = max_lr * 0.1
+
+    # Store base LRs for Muon schedule
+    if use_muon:
+        for group in optimizer.param_groups:
+            group["_base_lr"] = group["lr"]
 
     train_iter = iter(train_loader)
     running_loss = 0.0
@@ -133,9 +239,23 @@ def train(
 
     pbar = tqdm(range(num_steps), desc="Training", disable=not is_main(use_ddp))
     for step in pbar:
-        lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        # LR scheduling
+        if use_muon:
+            lr_mult = get_lr_multiplier(step, num_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = param_group["_base_lr"] * lr_mult
+            # Update Muon-specific per-step values
+            muon_mom = get_muon_momentum(step)
+            muon_wd_val = get_weight_decay(step, muon_wd, num_steps)
+            for param_group in optimizer.param_groups:
+                if param_group.get("kind") == "muon":
+                    param_group["momentum"] = muon_mom
+                    param_group["weight_decay"] = muon_wd_val
+            lr = lr_mult * max_lr  # for logging
+        else:
+            lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         try:
             batch = next(train_iter)
@@ -213,12 +333,23 @@ def main():
                         help="Name for this run (used for checkpoint filename)")
     parser.add_argument("--save_checkpoint", action="store_true",
                         help="Save model checkpoint at end of training")
+    # Muon optimizer arguments
+    parser.add_argument("--use_muon", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use MuonAdamW optimizer (default: True)")
+    parser.add_argument("--matrix_lr", type=float, default=0.005,
+                        help="Muon learning rate for 2D matrix params")
+    parser.add_argument("--embedding_lr", type=float, default=0.05,
+                        help="AdamW learning rate for embeddings")
+    parser.add_argument("--muon_wd", type=float, default=0.005,
+                        help="Muon weight decay (linearly decayed to 0)")
     args = parser.parse_args()
 
     # Autoscale max_lr: args.max_lr is calibrated at d_model=768
     # Wider models use lower LR (muP-style sqrt scaling)
-    base_lr = args.max_lr
-    args.max_lr = base_lr * (768 / args.d_model) ** 0.5
+    # (Only for AdamW fallback - Muon handles its own scaling)
+    if not args.use_muon:
+        base_lr = args.max_lr
+        args.max_lr = base_lr * (768 / args.d_model) ** 0.5
 
     # DDP setup (optional -- works with plain `python train.py`)
     local_rank, world_size, use_ddp = setup_ddp()
@@ -226,10 +357,13 @@ def main():
     use_wandb = not args.no_wandb
 
     if is_main(use_ddp):
-        if args.d_model != 768:
-            print(f"  Autoscaled max_lr from {base_lr:.2e} to {args.max_lr:.2e} (d_model={args.d_model})")
+        if args.use_muon:
+            print(f"  Muon optimizer: matrix_lr={args.matrix_lr}, embedding_lr={args.embedding_lr}, muon_wd={args.muon_wd}")
         else:
-            print(f"  max_lr={args.max_lr:.2e} (d_model={args.d_model})")
+            if args.d_model != 768:
+                print(f"  Autoscaled max_lr from {base_lr:.2e} to {args.max_lr:.2e} (d_model={args.d_model})")
+            else:
+                print(f"  max_lr={args.max_lr:.2e} (d_model={args.d_model})")
         if use_ddp:
             print(f"  DDP: rank {local_rank}, world_size {world_size}")
         else:
@@ -299,12 +433,7 @@ def main():
             })
 
     # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.max_lr,
-        betas=(0.9, 0.95),
-        weight_decay=0.3,
-    )
+    optimizer = setup_optimizer(model, args, use_ddp=use_ddp)
 
     # Train
     model = train(
@@ -318,6 +447,8 @@ def main():
         max_lr=args.max_lr,
         use_wandb=use_wandb,
         use_ddp=use_ddp,
+        use_muon=args.use_muon,
+        muon_wd=args.muon_wd,
     )
 
     # End-of-training summary
