@@ -213,6 +213,12 @@ def main():
                         help="Name for this run (used for checkpoint filename)")
     parser.add_argument("--save_checkpoint", action="store_true",
                         help="Save model checkpoint at end of training")
+    parser.add_argument("--modification", type=str, default=None,
+                        help="Description of modification for experiment tracker")
+    parser.add_argument("--intuition", type=str, default=None,
+                        help="Why this modification was made (for experiment tracker)")
+    parser.add_argument("--no_auto_eval", action="store_true",
+                        help="Skip automatic post-training evaluation")
     args = parser.parse_args()
 
     # Autoscale max_lr: args.max_lr is calibrated at d_model=768
@@ -344,12 +350,97 @@ def main():
             torch.save(raw_model_final.state_dict(), ckpt_path)
             print(f"  Checkpoint saved to {ckpt_path}")
 
+    # Auto-run experiment tracker after training (rank 0 only)
+    if is_main(use_ddp) and args.save_checkpoint and not args.no_auto_eval:
+        wandb_url = ""
+        if use_wandb:
+            import wandb as _wb
+            if _wb.run is not None:
+                wandb_url = _wb.run.get_url() or ""
+
+        _run_post_training_eval(args, wandb_url)
+
     if use_wandb and is_main(use_ddp):
         import wandb
         wandb.finish()
     if use_ddp:
         import torch.distributed as dist
         dist.destroy_process_group()
+
+
+
+def _run_post_training_eval(args, wandb_url: str = ""):
+    """Run experiment tracker pipeline after training completes."""
+    try:
+        from experiment_tracker import run_full_pipeline
+    except ImportError:
+        print("  ⚠ experiment_tracker.py not found, skipping post-training eval")
+        return
+
+    ckpt_path = f"checkpoints/{args.run_name}.pt"
+    if not os.path.exists(ckpt_path):
+        print(f"  ⚠ Checkpoint not found at {ckpt_path}, skipping post-training eval")
+        return
+
+    # Auto-generate modification description from flags if not provided
+    modification = args.modification
+    if not modification:
+        parts = []
+        if getattr(args, 'qk_norm', False):
+            parts.append("QK normalization")
+        if getattr(args, 'softcap', 0) > 0:
+            parts.append(f"logit softcapping ({args.softcap})")
+        if getattr(args, 'resid_scalars', False):
+            parts.append("per-layer residual scalars")
+        if getattr(args, 'use_muon', False):
+            parts.append("Muon optimizer")
+        if getattr(args, 'ffn_type', 'swiglu') == 'relu2':
+            parts.append(f"ReLU² FFN (d_ff={args.d_ff})")
+        modification = " + ".join(parts) if parts else "baseline (no modifications)"
+
+    intuition = args.intuition or "See branch documentation"
+
+    # Build log path
+    log_path = f"train_{args.run_name}.log"
+    if not os.path.exists(log_path):
+        log_path = None
+
+    # Build extra model kwargs for non-baseline architectures
+    extra_model_kwargs = {}
+    if getattr(args, 'ffn_type', None) and args.ffn_type != 'swiglu':
+        extra_model_kwargs["ffn_type"] = args.ffn_type
+    if getattr(args, 'qk_norm', False):
+        extra_model_kwargs["qk_norm"] = True
+    if getattr(args, 'softcap', 0) > 0:
+        extra_model_kwargs["softcap"] = args.softcap
+    if getattr(args, 'resid_scalars', False):
+        extra_model_kwargs["use_resid_scalars"] = True
+
+    print(f"\n{'='*60}")
+    print(f"  AUTO POST-TRAINING EVALUATION")
+    print(f"  Modification: {modification}")
+    print(f"{'='*60}")
+
+    try:
+        run_full_pipeline(
+            run_name=args.run_name,
+            modification=modification,
+            intuition=intuition,
+            checkpoint_path=ckpt_path,
+            model_variant=args.model,
+            d_model=args.d_model,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            d_ff=args.d_ff,
+            wandb_url=wandb_url,
+            log_path=log_path,
+            extra_model_kwargs=extra_model_kwargs or None,
+        )
+    except Exception as e:
+        print(f"\n  ❌ Post-training eval failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("  Training was successful — checkpoint was saved. Run experiment_tracker.py manually.")
 
 
 if __name__ == "__main__":
