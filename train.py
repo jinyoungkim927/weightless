@@ -203,10 +203,13 @@ def main():
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=2048)
+    parser.add_argument("--d_ff", type=int, default=3072)
     parser.add_argument("--model", type=str, default="baseline",
                         choices=["baseline", "baseline_plus"],
                         help="Model variant: baseline (dense) or baseline_plus (GQA + top-k FFN)")
+    parser.add_argument("--ffn_type", type=str, default="relu2",
+                        choices=["swiglu", "relu2"],
+                        help="FFN type: swiglu (3 matrices) or relu2 (2 matrices, ReLU squared)")
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default=None,
@@ -271,6 +274,7 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        ffn_type=args.ffn_type,
     )
     model.to(device)
     model = torch.compile(model)

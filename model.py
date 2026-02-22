@@ -40,6 +40,7 @@ class SimpleTransformer(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = SEQ_LEN,
         rope_theta: float = 10000.0,
+        ffn_type: str = "swiglu",
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -50,6 +51,7 @@ class SimpleTransformer(nn.Module):
         self.d_ff = d_ff
         self.head_dim = d_model // n_heads
         self.weight_tied = True
+        self.ffn_type = ffn_type
         
         # Token embeddings (no learned positional embedding - using RoPE)
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -64,7 +66,8 @@ class SimpleTransformer(nn.Module):
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout)
+            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout,
+                             ffn_type=ffn_type)
             for _ in range(n_layers)
         ])
         
@@ -205,6 +208,19 @@ class SwiGLUFF(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
+class ReLU2FF(nn.Module):
+    """ReLU² feed-forward network (2 matrices instead of SwiGLU's 3)."""
+    def __init__(self, d_model: int, d_ff: int, bias: bool = False):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.c_fc = nn.Linear(d_model, d_ff, bias=bias)
+        self.c_proj = nn.Linear(d_ff, d_model, bias=bias)
+
+    def forward(self, x):
+        return self.c_proj(F.relu(self.c_fc(x)).square())
+
+
 class TopKSwiGLUFF(nn.Module):
     """SwiGLU FFN with top-k activation sparsity.
 
@@ -251,12 +267,15 @@ class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm."""
     
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
-                 d_ff: int, dropout: float, ffn_top_k: int | None = None):
+                 d_ff: int, dropout: float, ffn_top_k: int | None = None,
+                 ffn_type: str = "swiglu"):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
-        if ffn_top_k is not None:
+        if ffn_type == "relu2":
+            self.ff = ReLU2FF(d_model, d_ff)
+        elif ffn_top_k is not None:
             self.ff = TopKSwiGLUFF(d_model, d_ff, top_k=ffn_top_k)
         else:
             self.ff = SwiGLUFF(d_model, d_ff)
@@ -344,6 +363,44 @@ def create_model(variant: str = "baseline", **kwargs):
         return BaselinePlusTransformer(**kwargs)
     else:
         return SimpleTransformer(**kwargs)
+
+
+def get_inference_profile(model):
+    """Compute inference profile (bytes per token) for the model."""
+    raw = model.module if hasattr(model, "module") else model
+    if hasattr(raw, "_orig_mod"):
+        raw = raw._orig_mod
+    d = raw.d_model
+    n_layers = raw.n_layers
+    n_heads = raw.n_heads
+    n_kv_heads = getattr(raw, "n_kv_heads", n_heads)
+    d_ff = raw.d_ff
+    head_dim = d // n_heads
+    vocab_size = raw.vocab_size
+
+    # Embedding + LM head (weight-tied = counted once)
+    emb_bytes = vocab_size * d * 2  # bf16
+
+    # Attention: Q, K, V, O projections per layer
+    attn_bytes = n_layers * (
+        d * n_heads * head_dim       # Q
+        + d * n_kv_heads * head_dim  # K
+        + d * n_kv_heads * head_dim  # V
+        + n_heads * head_dim * d     # O
+    ) * 2  # bf16
+
+    # FFN per layer
+    ffn_type = getattr(raw, "ffn_type", "swiglu")
+    if ffn_type == "relu2":
+        ffn_bytes = n_layers * (d * d_ff + d_ff * d) * 2  # 2 matrices
+    else:
+        ffn_bytes = n_layers * (d * d_ff * 3) * 2  # 3 matrices (SwiGLU)
+
+    # LayerNorm
+    ln_bytes = n_layers * 2 * d * 2 + d * 2  # per-layer + final
+
+    total = emb_bytes + attn_bytes + ffn_bytes + ln_bytes
+    return total
 
 
 if __name__ == "__main__":
