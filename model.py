@@ -40,6 +40,9 @@ class SimpleTransformer(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = SEQ_LEN,
         rope_theta: float = 10000.0,
+        qk_norm: bool = False,
+        softcap: float = 0.0,
+        use_resid_scalars: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -50,6 +53,8 @@ class SimpleTransformer(nn.Module):
         self.d_ff = d_ff
         self.head_dim = d_model // n_heads
         self.weight_tied = True
+        self.softcap = softcap
+        self.use_resid_scalars = use_resid_scalars
         
         # Token embeddings (no learned positional embedding - using RoPE)
         self.token_emb = nn.Embedding(vocab_size, d_model)
@@ -64,12 +69,18 @@ class SimpleTransformer(nn.Module):
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout)
+            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout,
+                             qk_norm=qk_norm)
             for _ in range(n_layers)
         ])
         
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # Per-layer residual scalars
+        if use_resid_scalars:
+            self.resid_lambdas = nn.Parameter(torch.ones(n_layers))
+            self.x0_lambdas = nn.Parameter(torch.zeros(n_layers) + 0.1)
         
         # Weight tying
         self.head.weight = self.token_emb.weight
@@ -102,11 +113,21 @@ class SimpleTransformer(nn.Module):
             torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
         )
         
-        for layer in self.layers:
+        # Save initial embedding for residual scalar mixing
+        if self.use_resid_scalars:
+            x0 = x
+        
+        for i, layer in enumerate(self.layers):
+            if self.use_resid_scalars:
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = layer(x, causal_mask, attention_mask, self.rope, positions)
         
         x = self.ln_f(x)
         logits = self.head(x)
+        
+        # Logit softcapping
+        if self.softcap > 0:
+            logits = self.softcap * torch.tanh(logits.float() / self.softcap)
         
         return logits
     
@@ -138,13 +159,15 @@ class MultiHeadAttention(nn.Module):
     dot product.
     """
     
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float,
+                 qk_norm: bool = False):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
         self.dropout = dropout
+        self.qk_norm = qk_norm
         assert n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         self.n_rep = n_heads // n_kv_heads  # how many Q heads per KV head
 
@@ -163,6 +186,11 @@ class MultiHeadAttention(nn.Module):
         # Apply RoPE
         q = rope(q, positions)
         k = rope(k, positions)
+        
+        # QK normalization (after RoPE, no learnable params)
+        if self.qk_norm:
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
         
         # Expand KV heads for GQA: (B, n_kv_heads, T, hd) -> (B, n_heads, T, hd)
         if self.n_rep > 1:
@@ -251,10 +279,12 @@ class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm."""
     
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
-                 d_ff: int, dropout: float, ffn_top_k: int | None = None):
+                 d_ff: int, dropout: float, ffn_top_k: int | None = None,
+                 qk_norm: bool = False):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
+        self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout,
+                                       qk_norm=qk_norm)
         self.ln2 = nn.LayerNorm(d_model)
         if ffn_top_k is not None:
             self.ff = TopKSwiGLUFF(d_model, d_ff, top_k=ffn_top_k)
@@ -341,7 +371,10 @@ def create_model(variant: str = "baseline", **kwargs):
         **kwargs: passed to the model constructor
     """
     if variant == "baseline_plus":
-        return BaselinePlusTransformer(**kwargs)
+        # BaselinePlusTransformer doesn't support new params yet
+        bp_kwargs = {k: v for k, v in kwargs.items()
+                     if k not in ("qk_norm", "softcap", "use_resid_scalars")}
+        return BaselinePlusTransformer(**bp_kwargs)
     else:
         return SimpleTransformer(**kwargs)
 

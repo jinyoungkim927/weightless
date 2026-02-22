@@ -207,6 +207,16 @@ def main():
     parser.add_argument("--model", type=str, default="baseline",
                         choices=["baseline", "baseline_plus"],
                         help="Model variant: baseline (dense) or baseline_plus (GQA + top-k FFN)")
+    parser.add_argument("--qk_norm", action="store_true", default=True,
+                        help="Enable QK normalization in attention (default: True)")
+    parser.add_argument("--no_qk_norm", action="store_true",
+                        help="Disable QK normalization")
+    parser.add_argument("--softcap", type=float, default=15.0,
+                        help="Logit softcapping value (0 to disable)")
+    parser.add_argument("--resid_scalars", action="store_true", default=True,
+                        help="Enable per-layer residual scalars (default: True)")
+    parser.add_argument("--no_resid_scalars", action="store_true",
+                        help="Disable per-layer residual scalars")
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default=None,
@@ -265,12 +275,21 @@ def main():
     # Model
     if is_main(use_ddp):
         print(f"  Creating model (variant={args.model}, BF16 + torch.compile)...")
+    # Process attention/residual trick flags
+    if args.no_qk_norm:
+        args.qk_norm = False
+    if args.no_resid_scalars:
+        args.resid_scalars = False
+
     model = create_model(
         variant=args.model,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        qk_norm=args.qk_norm,
+        softcap=args.softcap,
+        use_resid_scalars=args.resid_scalars,
     )
     model.to(device)
     model = torch.compile(model)
