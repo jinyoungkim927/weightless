@@ -58,3 +58,6 @@ Thumbs.db
 
 # Story QA data (large)
 story_qa_v4_plaintext_shards/*.zip
+
+# Experiment tracker spreadsheet (shared across branches, not branch-specific)
+experiment_tracker.xlsx

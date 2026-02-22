@@ -769,6 +769,7 @@ def run_full_pipeline(
     wandb_url: str = "",
     n_examples: int = 10,
     log_path: str = None,
+    extra_model_kwargs: dict = None,
 ):
     """Full pipeline: load model → run inference → update spreadsheet.
 
@@ -783,13 +784,16 @@ def run_full_pipeline(
 
     # 1. Load model
     print(f"\n[1/5] Loading model ({model_variant}) ...")
-    model = create_model(
+    model_kwargs = dict(
         variant=model_variant,
         d_model=d_model,
         n_layers=n_layers,
         n_heads=n_heads,
         d_ff=d_ff,
     )
+    if extra_model_kwargs:
+        model_kwargs.update(extra_model_kwargs)
+    model = create_model(**model_kwargs)
 
     if checkpoint_path and os.path.exists(checkpoint_path):
         sd = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -913,8 +917,27 @@ def main():
                         help="Number of story QA examples to evaluate")
     parser.add_argument("--log_path", default=None,
                         help="Path to train.log for metric extraction")
+    parser.add_argument("--ffn_type", default=None,
+                        help="FFN type: swiglu or relu2 (passed to create_model)")
+    parser.add_argument("--qk_norm", action="store_true", default=False,
+                        help="Enable QK normalization (passed to create_model)")
+    parser.add_argument("--softcap", type=float, default=0.0,
+                        help="Logit softcapping value (passed to create_model)")
+    parser.add_argument("--resid_scalars", action="store_true", default=False,
+                        help="Enable per-layer residual scalars (passed to create_model)")
 
     args = parser.parse_args()
+
+    # Collect extra model kwargs from CLI
+    extra_model_kwargs = {}
+    if args.ffn_type:
+        extra_model_kwargs["ffn_type"] = args.ffn_type
+    if args.qk_norm:
+        extra_model_kwargs["qk_norm"] = True
+    if args.softcap > 0:
+        extra_model_kwargs["softcap"] = args.softcap
+    if args.resid_scalars:
+        extra_model_kwargs["use_resid_scalars"] = True
 
     run_full_pipeline(
         run_name=args.run_name,
@@ -930,6 +953,7 @@ def main():
         wandb_url=args.wandb_url,
         n_examples=args.n_examples,
         log_path=args.log_path,
+        extra_model_kwargs=extra_model_kwargs or None,
     )
 
 
