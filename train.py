@@ -219,6 +219,10 @@ def main():
                         help="Why this modification was made (for experiment tracker)")
     parser.add_argument("--no_auto_eval", action="store_true",
                         help="Skip automatic post-training evaluation")
+    parser.add_argument("--qa_dir", type=str, default=None,
+                        help="Path to QA-augmented parquet directory for data mixing")
+    parser.add_argument("--qa_ratio", type=float, default=0.1,
+                        help="Fraction of QA samples when --qa_dir is set")
     args = parser.parse_args()
 
     # Autoscale max_lr: args.max_lr is calibrated at d_model=768
@@ -264,7 +268,8 @@ def main():
     if is_main(use_ddp):
         print("  Setting up data loaders...")
     train_loader = get_dataloader(split="train", batch_size=args.batch_size,
-                                  streaming=True, rank=rank, world_size=world_size)
+                                  streaming=True, rank=rank, world_size=world_size,
+                                  qa_dir=args.qa_dir, qa_ratio=args.qa_ratio)
     val_loader = get_dataloader(split="test", batch_size=args.batch_size,
                                 streaming=True, rank=rank, world_size=world_size)
 
