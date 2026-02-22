@@ -906,7 +906,7 @@ def main():
     parser.add_argument("--checkpoint", default=None,
                         help="Path to model checkpoint")
     parser.add_argument("--model", default="baseline",
-                        choices=["baseline", "baseline_plus"])
+                        choices=["baseline", "baseline_plus", "copy_gate"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)

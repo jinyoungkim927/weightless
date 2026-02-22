@@ -420,8 +420,9 @@ class CopyGateTransformer(SimpleTransformer):
         copy_scores.masked_fill_(causal_mask.unsqueeze(0), float('-inf'))
         copy_attn = F.softmax(copy_scores, dim=-1)  # (B, T, T)
 
-        # Scatter copy attention into vocab space
-        copy_probs = torch.zeros_like(gen_logits)
+        # Scatter copy attention into vocab space (ensure matching dtypes)
+        copy_probs = torch.zeros_like(gen_logits, dtype=torch.float32)
+        copy_attn = copy_attn.float()
         copy_probs.scatter_add_(
             2,
             input_ids.unsqueeze(1).expand(-1, T, -1),
@@ -429,8 +430,8 @@ class CopyGateTransformer(SimpleTransformer):
         )
 
         # Blend generation and copy distributions
-        gen_probs = F.softmax(gen_logits, dim=-1)
-        blended = (1 - p_copy) * gen_probs + p_copy * copy_probs
+        gen_probs = F.softmax(gen_logits.float(), dim=-1)
+        blended = (1 - p_copy.float()) * gen_probs + p_copy.float() * copy_probs
 
         # Return log-probs (compatible with cross_entropy: CE(log(p), y) = -log(p_y))
         return torch.log(blended + 1e-10)

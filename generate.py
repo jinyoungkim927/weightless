@@ -238,7 +238,12 @@ class ModelInstrument:
         def fn(module, inputs, output):
             x = inputs[0]
             with torch.no_grad():
-                gate = F.silu(module.w1(x)) * module.w3(x)
+                if hasattr(module, 'w1'):  # SwiGLU
+                    gate = F.silu(module.w1(x)) * module.w3(x)
+                elif hasattr(module, 'c_fc'):  # ReLU2FF
+                    gate = F.relu(module.c_fc(x)).square()
+                else:
+                    gate = output  # fallback
             self.ffn_gate[layer_idx] = gate.cpu().float().numpy()
         return fn
 
@@ -1040,6 +1045,14 @@ def main():
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true",
                         help="Create a public Gradio link")
+    parser.add_argument("--ffn_type", default=None,
+                        help="FFN type: swiglu or relu2")
+    parser.add_argument("--qk_norm", action="store_true", default=False,
+                        help="Enable QK normalization")
+    parser.add_argument("--softcap", type=float, default=0.0,
+                        help="Logit softcapping value")
+    parser.add_argument("--resid_scalars", action="store_true", default=False,
+                        help="Enable per-layer residual scalars")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1047,12 +1060,22 @@ def main():
 
     # ----- Load model onto GPU -----
     print("  Loading model …")
+    extra_kwargs = {}
+    if args.ffn_type:
+        extra_kwargs["ffn_type"] = args.ffn_type
+    if args.qk_norm:
+        extra_kwargs["qk_norm"] = True
+    if args.softcap > 0:
+        extra_kwargs["softcap"] = args.softcap
+    if args.resid_scalars:
+        extra_kwargs["use_resid_scalars"] = True
     model = create_model(
         variant=args.model,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        **extra_kwargs,
     )
 
     ckpt = args.checkpoint
