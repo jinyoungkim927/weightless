@@ -1,4 +1,8 @@
-"""Training script with wandb logging and optional DDP support."""
+"""Training script with wandb logging and optional DDP support.
+
+Everything-optimized: combines Muon optimizer, ReLU² FFN, QK norm,
+logit softcapping, per-layer residual scalars, and QA data augmentation.
+"""
 
 import argparse
 import os
@@ -56,6 +60,81 @@ def get_rank(use_ddp: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Optimizer setup
+# ---------------------------------------------------------------------------
+
+def setup_optimizer(model, args, use_ddp=False):
+    """Set up MuonAdamW or AdamW optimizer with proper param grouping."""
+    if not args.use_muon:
+        return torch.optim.AdamW(
+            model.parameters(),
+            lr=args.max_lr,
+            betas=(0.9, 0.95),
+            weight_decay=0.3,
+        )
+
+    from muon_optim import MuonAdamW
+
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+
+    # LR scaling: (d_model/768)^-0.5
+    lr_scale = (raw_model.d_model / 768) ** -0.5
+
+    # Classify parameters
+    embedding_params = []
+    muon_params_by_shape = {}  # shape -> list of params
+    skip_names = set()
+
+    # Identify weight-tied lm_head
+    if hasattr(raw_model, 'weight_tied') and raw_model.weight_tied:
+        skip_names.add('head.weight')
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name in skip_names:
+            continue
+        if 'token_emb' in name:
+            embedding_params.append(param)
+        elif param.ndim == 2:
+            shape = param.shape
+            if shape not in muon_params_by_shape:
+                muon_params_by_shape[shape] = []
+            muon_params_by_shape[shape].append(param)
+        else:
+            embedding_params.append(param)  # 1D params (layernorm etc) go to AdamW
+
+    param_groups = []
+
+    # Embedding / scalar params -> AdamW
+    if embedding_params:
+        param_groups.append({
+            'params': embedding_params,
+            'kind': 'adamw',
+            'lr': args.embedding_lr * lr_scale,
+            'betas': (0.9, 0.95),
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Matrix params -> Muon (one group per shape for stacking)
+    for shape, params in muon_params_by_shape.items():
+        param_groups.append({
+            'params': params,
+            'kind': 'muon',
+            'lr': args.matrix_lr * lr_scale,
+            'momentum': 0.85,
+            'ns_steps': 5,
+            'beta2': 0.7,
+            'weight_decay': args.muon_wd,
+        })
+
+    return MuonAdamW(param_groups)
+
+
+# ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
@@ -64,7 +143,7 @@ def compute_loss(model, batch, device):
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     attention_mask = batch["attention_mask"].to(device)
-    
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
         logits = model(input_ids, attention_mask)
         loss = F.cross_entropy(
@@ -76,11 +155,35 @@ def compute_loss(model, batch, device):
 
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
-    """Linear warmup then linear decay."""
+    """Linear warmup then linear decay (used when use_muon=False)."""
     if step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
     decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
     return max_lr - (max_lr - min_lr) * decay_ratio
+
+
+def get_lr_multiplier(step: int, total_steps: int) -> float:
+    """Warmup (2%) -> constant (48%) -> warmdown (50%, linear to 0)."""
+    warmup_steps = round(0.02 * total_steps)
+    warmdown_steps = round(0.50 * total_steps)
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    elif step <= total_steps - warmdown_steps:
+        return 1.0
+    else:
+        progress = (total_steps - step) / warmdown_steps
+        return progress
+
+
+def get_muon_momentum(step: int) -> float:
+    """Momentum warmup: 0.85 -> 0.95 over first 300 steps."""
+    frac = min(step / 300, 1.0)
+    return (1 - frac) * 0.85 + frac * 0.95
+
+
+def get_weight_decay(step: int, base_wd: float, total_steps: int) -> float:
+    """Linear decay of weight decay to 0 over training."""
+    return base_wd * (1 - step / total_steps)
 
 
 @torch.no_grad()
@@ -89,14 +192,14 @@ def evaluate(model, val_loader, device, max_batches: int = 20):
     model.eval()
     total_loss = 0.0
     n_batches = 0
-    
+
     for batch in val_loader:
         loss = compute_loss(model, batch, device)
         total_loss += loss.item()
         n_batches += 1
         if n_batches >= max_batches:
             break
-    
+
     model.train()
     return total_loss / n_batches
 
@@ -117,12 +220,19 @@ def train(
     warmup_steps: int = 200,
     use_wandb: bool = True,
     use_ddp: bool = False,
+    use_muon: bool = True,
+    muon_wd: float = 0.02,
 ):
     """Main training loop with logging every eval_every steps."""
     model.train()
     raw_model = model.module if hasattr(model, "module") else model
     num_params = raw_model.count_parameters(count_zeros=True)
     min_lr = max_lr * 0.1
+
+    # Store base LRs for Muon schedule
+    if use_muon:
+        for group in optimizer.param_groups:
+            group["_base_lr"] = group["lr"]
 
     train_iter = iter(train_loader)
     running_loss = 0.0
@@ -133,9 +243,23 @@ def train(
 
     pbar = tqdm(range(num_steps), desc="Training", disable=not is_main(use_ddp))
     for step in pbar:
-        lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+        # LR scheduling
+        if use_muon:
+            lr_mult = get_lr_multiplier(step, num_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = param_group["_base_lr"] * lr_mult
+            # Update Muon-specific per-step values
+            muon_mom = get_muon_momentum(step)
+            muon_wd_val = get_weight_decay(step, muon_wd, num_steps)
+            for param_group in optimizer.param_groups:
+                if param_group.get("kind") == "muon":
+                    param_group["momentum"] = muon_mom
+                    param_group["weight_decay"] = muon_wd_val
+            lr = lr_mult * max_lr  # for logging
+        else:
+            lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
         try:
             batch = next(train_iter)
@@ -203,10 +327,40 @@ def main():
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=2048)
+    parser.add_argument("--d_ff", type=int, default=3072)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "baseline_plus"],
-                        help="Model variant: baseline (dense) or baseline_plus (GQA + top-k FFN)")
+                        choices=["baseline", "baseline_plus", "copy_gate"],
+                        help="Model variant")
+    # FFN type (from relu2-ffn)
+    parser.add_argument("--ffn_type", type=str, default="relu2",
+                        choices=["swiglu", "relu2"],
+                        help="FFN type: swiglu (3 matrices) or relu2 (2 matrices, ReLU squared)")
+    # Attention/residual tricks (from attn-residual-tricks)
+    parser.add_argument("--qk_norm", action="store_true", default=True,
+                        help="Enable QK normalization in attention (default: True)")
+    parser.add_argument("--no_qk_norm", action="store_true",
+                        help="Disable QK normalization")
+    parser.add_argument("--softcap", type=float, default=15.0,
+                        help="Logit softcapping value (0 to disable)")
+    parser.add_argument("--resid_scalars", action="store_true", default=True,
+                        help="Enable per-layer residual scalars (default: True)")
+    parser.add_argument("--no_resid_scalars", action="store_true",
+                        help="Disable per-layer residual scalars")
+    # Muon optimizer (from muon-optimizer)
+    parser.add_argument("--use_muon", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use MuonAdamW optimizer (default: True)")
+    parser.add_argument("--matrix_lr", type=float, default=0.005,
+                        help="Muon learning rate for 2D matrix params")
+    parser.add_argument("--embedding_lr", type=float, default=0.05,
+                        help="AdamW learning rate for embeddings")
+    parser.add_argument("--muon_wd", type=float, default=0.005,
+                        help="Muon weight decay (linearly decayed to 0)")
+    # Data augmentation (from data-optimization)
+    parser.add_argument("--qa_dir", type=str, default=None,
+                        help="Path to QA-augmented parquet directory for data mixing")
+    parser.add_argument("--qa_ratio", type=float, default=0.1,
+                        help="Fraction of QA samples when --qa_dir is set")
+    # Logging and tracking
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default=None,
@@ -221,10 +375,17 @@ def main():
                         help="Skip automatic post-training evaluation")
     args = parser.parse_args()
 
+    # Process attention/residual trick flags
+    if args.no_qk_norm:
+        args.qk_norm = False
+    if args.no_resid_scalars:
+        args.resid_scalars = False
+
     # Autoscale max_lr: args.max_lr is calibrated at d_model=768
-    # Wider models use lower LR (muP-style sqrt scaling)
-    base_lr = args.max_lr
-    args.max_lr = base_lr * (768 / args.d_model) ** 0.5
+    # (Only for AdamW fallback - Muon handles its own scaling)
+    if not args.use_muon:
+        base_lr = args.max_lr
+        args.max_lr = base_lr * (768 / args.d_model) ** 0.5
 
     # DDP setup (optional -- works with plain `python train.py`)
     local_rank, world_size, use_ddp = setup_ddp()
@@ -232,10 +393,13 @@ def main():
     use_wandb = not args.no_wandb
 
     if is_main(use_ddp):
-        if args.d_model != 768:
-            print(f"  Autoscaled max_lr from {base_lr:.2e} to {args.max_lr:.2e} (d_model={args.d_model})")
+        if args.use_muon:
+            print(f"  Muon optimizer: matrix_lr={args.matrix_lr}, embedding_lr={args.embedding_lr}, muon_wd={args.muon_wd}")
         else:
-            print(f"  max_lr={args.max_lr:.2e} (d_model={args.d_model})")
+            if args.d_model != 768:
+                print(f"  Autoscaled max_lr from {base_lr:.2e} to {args.max_lr:.2e} (d_model={args.d_model})")
+            else:
+                print(f"  max_lr={args.max_lr:.2e} (d_model={args.d_model})")
         if use_ddp:
             print(f"  DDP: rank {local_rank}, world_size {world_size}")
         else:
@@ -264,7 +428,8 @@ def main():
     if is_main(use_ddp):
         print("  Setting up data loaders...")
     train_loader = get_dataloader(split="train", batch_size=args.batch_size,
-                                  streaming=True, rank=rank, world_size=world_size)
+                                  streaming=True, rank=rank, world_size=world_size,
+                                  qa_dir=args.qa_dir, qa_ratio=args.qa_ratio)
     val_loader = get_dataloader(split="test", batch_size=args.batch_size,
                                 streaming=True, rank=rank, world_size=world_size)
 
@@ -277,6 +442,10 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        ffn_type=args.ffn_type,
+        qk_norm=args.qk_norm,
+        softcap=args.softcap,
+        use_resid_scalars=args.resid_scalars,
     )
     model.to(device)
     model = torch.compile(model)
@@ -305,12 +474,7 @@ def main():
             })
 
     # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.max_lr,
-        betas=(0.9, 0.95),
-        weight_decay=0.3,
-    )
+    optimizer = setup_optimizer(model, args, use_ddp=use_ddp)
 
     # Train
     model = train(
@@ -324,6 +488,8 @@ def main():
         max_lr=args.max_lr,
         use_wandb=use_wandb,
         use_ddp=use_ddp,
+        use_muon=args.use_muon,
+        muon_wd=args.muon_wd,
     )
 
     # End-of-training summary
@@ -368,18 +534,17 @@ def main():
         dist.destroy_process_group()
 
 
-
 def _run_post_training_eval(args, wandb_url: str = ""):
     """Run experiment tracker pipeline after training completes."""
     try:
         from experiment_tracker import run_full_pipeline
     except ImportError:
-        print("  ⚠ experiment_tracker.py not found, skipping post-training eval")
+        print("  experiment_tracker.py not found, skipping post-training eval")
         return
 
     ckpt_path = f"checkpoints/{args.run_name}.pt"
     if not os.path.exists(ckpt_path):
-        print(f"  ⚠ Checkpoint not found at {ckpt_path}, skipping post-training eval")
+        print(f"  Checkpoint not found at {ckpt_path}, skipping post-training eval")
         return
 
     # Auto-generate modification description from flags if not provided
@@ -395,7 +560,7 @@ def _run_post_training_eval(args, wandb_url: str = ""):
         if getattr(args, 'use_muon', False):
             parts.append("Muon optimizer")
         if getattr(args, 'ffn_type', 'swiglu') == 'relu2':
-            parts.append(f"ReLU² FFN (d_ff={args.d_ff})")
+            parts.append(f"ReLU2 FFN (d_ff={args.d_ff})")
         modification = " + ".join(parts) if parts else "baseline (no modifications)"
 
     intuition = args.intuition or "See branch documentation"
@@ -437,10 +602,10 @@ def _run_post_training_eval(args, wandb_url: str = ""):
             extra_model_kwargs=extra_model_kwargs or None,
         )
     except Exception as e:
-        print(f"\n  ❌ Post-training eval failed: {e}")
+        print(f"\n  Post-training eval failed: {e}")
         import traceback
         traceback.print_exc()
-        print("  Training was successful — checkpoint was saved. Run experiment_tracker.py manually.")
+        print("  Training was successful -- checkpoint was saved. Run experiment_tracker.py manually.")
 
 
 if __name__ == "__main__":
