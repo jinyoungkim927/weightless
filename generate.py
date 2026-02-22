@@ -683,7 +683,7 @@ def run_benchmark(model, tokenizer, device, seed=0, max_tokens=60,
 # Build Gradio App
 # ---------------------------------------------------------------------------
 
-def build_static_app(precomputed: dict):
+def build_static_app(precomputed: dict, run_name: str = ""):
     """Build a fully static Gradio dashboard from pre-computed results.
 
     No model is held in memory — every output was generated at startup and the
@@ -698,9 +698,10 @@ def build_static_app(precomputed: dict):
         "low": "#f85149",
     }
 
-    with gr.Blocks(title="Weightless – Model Inspector") as app:
+    display_name = run_name or "Model Inspector"
+    with gr.Blocks(title=f"Weightless – {display_name}") as app:
         gr.Markdown(
-            "# 🔬 Weightless – Static Inference Dashboard\n"
+            f"# Weightless – {display_name}\n"
             "All outputs were **pre-computed at startup** from a random "
             "Story QA sample. No GPU is held by this dashboard.\n"
         )
@@ -1053,6 +1054,8 @@ def main():
                         help="Logit softcapping value")
     parser.add_argument("--resid_scalars", action="store_true", default=False,
                         help="Enable per-layer residual scalars")
+    parser.add_argument("--run_name", type=str, default="",
+                        help="Display name for this run (shown in dashboard title)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1120,7 +1123,7 @@ def main():
 
     # ----- Build & launch static Gradio -----
     print(f"  Building static UI (port {args.port}) …")
-    app = build_static_app(precomputed)
+    app = build_static_app(precomputed, run_name=args.run_name)
     app.launch(
         server_name="0.0.0.0",
         server_port=args.port,
