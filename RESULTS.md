@@ -1,38 +1,53 @@
-# Everything Optimized Branch Results
+# True Everything — Results
 
-## Experiments
+Branch: `modification/true-everything`
 
-### everything_optimized_5500_rerun (0.72B tier)
-- **Date**: 2026-02-27
-- **Config**: 5,500 steps, 8x H100 DDP, batch_size=32, d_model=768, n_layers=8, n_heads=8, d_ff=3072
-- **Modification**: All tricks combined
-  - `--ffn_type relu2 --qk_norm --softcap 15.0 --resid_scalars`
-  - `--use_muon --matrix_lr 0.005 --embedding_lr 0.05 --muon_wd 0.005`
-  - `--qa_dir data/qa_augmented --qa_ratio 0.1`
-- **Tokens trained**: 720,896,000 (0.72B)
-- **Final val_loss**: 3.2661
-- **Non-zero params**: 95,246,608
-- **Story QA accuracy**: 72% (100-sample benchmark, LLM judge)
-- **Checkpoint**: `checkpoints/everything_optimized_5500_rerun.pt` (364 MB)
-- **WandB**: https://wandb.ai/jinyoungkim927/weightless/runs/friejl4l
-- **Note**: Rerun of original everything_optimized_5500 which was incorrectly run on 1 GPU (0.09B tokens). This rerun uses correct 8-GPU DDP for 0.72B tokens. Best val_loss and Story QA accuracy in the 0.72B tier.
+## What This Branch Adds
 
-### everything_50M_rerun (0.05B tier)
-- **Date**: 2026-02-27
-- **Config**: 3,050 steps, 1 GPU, batch_size=32, d_model=768, n_layers=8, n_heads=8, d_ff=3072
-- **Modification**: Same as above, at smallest scale
-- **Tokens trained**: 49,152,000 (0.05B)
-- **Final val_loss**: 3.8948
-- **Non-zero params**: 95,246,608
-- **Story QA accuracy**: 69% (100-sample benchmark, LLM judge)
-- **Checkpoint**: `checkpoints/everything_50M_rerun.pt` (364 MB)
-- **WandB**: https://wandb.ai/jinyoungkim927/weightless/runs/jf0s3p1l
-- **Note**: Rerun for reproducibility. Original recorded 65% vs a separate report of 25%. This rerun yields 69%, confirming the original results replicate well.
+This branch combines **ALL** modifications that were individually tested, including two that were missing from the original `everything-optimized`:
 
-### everything_optimized_5500 (original) — previous run
-- **Story QA accuracy**: 63% (original) / 25% (separate report)
-- **Note**: Was single-GPU (0.09B tokens incorrectly), now corrected to 0.72B
+| Modification | Flag(s) | Source Branch | In everything-optimized? |
+|---|---|---|---|
+| ReLU² FFN | `--ffn_type relu2`, d_ff=3072 | modification/relu2-ffn | Yes |
+| Muon optimizer | `--use_muon` | modification/muon-optimizer | Yes |
+| QK normalization | `--qk_norm` | modification/attn-residual-tricks | Yes |
+| Logit softcapping | `--softcap 15.0` | modification/attn-residual-tricks | Yes |
+| Residual scalars | `--resid_scalars` | modification/attn-residual-tricks | Yes |
+| QA data augmentation | `--qa_dir`, `--qa_ratio 0.1` | modification/data-optimization | Yes |
+| **Weight sparsity** | `--weight_sparsity 0.3` | modification/weight-sparsity | **NEW** |
+| **Copy gate** | Phase B training | modification/copy-gate | **NEW** |
 
-### everything_50M (original) — previous run
-- **Story QA accuracy**: 65%
-- **WandB**: https://wandb.ai/jinyoungkim927/weightless/runs/8gi63uty
+## Results (50M tokens, 1 GPU)
+
+| Run | QA Data | Val Loss | Sparsity | Story QA Acc |
+|-----|---------|----------|----------|-------------|
+| true_everything_50M | Yes | 3.9465 | 28.9% | **57%** |
+| true_everything_no_qa_50M | No | 3.9429 | 28.9% | **15%** |
+
+### Copy Gate Training (Phase B)
+
+| Run | Val Loss Before | Val Loss After | Delta | p_copy |
+|-----|----------------|---------------|-------|--------|
+| With QA | 3.9376 | 3.9247 | -0.013 | 3.5% |
+| Without QA | 3.9341 | 3.9211 | -0.013 | 3.5% |
+
+## Comparison with everything_optimized
+
+| Run | Modifications | Tokens | Story QA |
+|-----|---------------|--------|----------|
+| everything_optimized_5500_rerun | All arch mods + QA data | 0.72B | **72%** |
+| everything_50M_rerun | All arch mods + QA data | 0.05B | **69%** |
+| true_everything_50M | + sparsity + copy gate | 0.05B | 57% |
+| true_everything_no_qa_50M | + sparsity + copy gate, NO QA | 0.05B | 15% |
+
+## Key Findings
+
+1. **QA data is the dominant factor**: Removing it drops accuracy from 57% to 15%
+2. **Sparsity + copy gate hurt at 50M scale**: 69% → 57% when adding these modifications on top of everything-optimized
+3. **Copy gate provides modest val_loss improvement** (~0.013) but doesn't significantly affect Story QA
+4. Weight sparsity converged to ~28.9% (target 30%) with 48 managed parameter matrices
+
+## WandB Links
+
+- true_everything_50M: https://wandb.ai/jinyoungkim927/weightless/runs/t50rm09f
+- true_everything_no_qa_50M: https://wandb.ai/jinyoungkim927/weightless/runs/kr80al8r
