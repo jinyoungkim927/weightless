@@ -1,7 +1,8 @@
 """Training script with wandb logging and optional DDP support.
 
-Everything-optimized: combines Muon optimizer, ReLU² FFN, QK norm,
-logit softcapping, per-layer residual scalars, and QA data augmentation.
+True-everything: combines Muon optimizer, ReLU² FFN, QK norm,
+logit softcapping, per-layer residual scalars, QA data augmentation,
+weight sparsity (RigL-style prune-regrow), and copy gate.
 """
 
 import argparse
@@ -57,6 +58,127 @@ def get_rank(use_ddp: bool = False):
         return 0
     import torch.distributed as dist
     return dist.get_rank()
+
+
+# ---------------------------------------------------------------------------
+# Weight sparsity: Gradual Magnitude Pruning with Gradient-Guided Regrowth
+# ---------------------------------------------------------------------------
+
+class SparseTopologyManager:
+    """Manages dynamic sparse training for 2D weight matrices.
+
+    Maintains binary masks on weight matrices. Every `update_interval` steps:
+      1. Prune: zero the smallest-magnitude active weights (fraction = drop_fraction)
+      2. Regrow: activate the highest-gradient dormant weights (same count)
+    Total sparsity stays constant; the topology adapts to where gradients demand capacity.
+
+    Sparsity ramps up on a cubic schedule during a warmup phase, then the topology
+    continues to evolve at fixed sparsity via prune-regrow cycles.
+    """
+
+    def __init__(self, model, target_sparsity: float = 0.3,
+                 warmup_steps: int = 1000, update_interval: int = 100,
+                 drop_fraction: float = 0.3):
+        self.target_sparsity = target_sparsity
+        self.warmup_steps = warmup_steps
+        self.update_interval = update_interval
+        self.drop_fraction = drop_fraction
+
+        # Collect 2D weight matrices (skip embeddings, LayerNorm, biases, copy_gate)
+        self.params = []
+        self.masks = {}
+        for name, param in model.named_parameters():
+            if (param.ndim == 2
+                    and 'token_emb' not in name
+                    and 'head.' not in name
+                    and 'copy_gate' not in name):
+                self.params.append((name, param))
+                # Start fully dense (all ones)
+                self.masks[name] = torch.ones_like(param, dtype=torch.bool)
+
+    def _current_sparsity(self, step: int) -> float:
+        """Cubic ramp from 0 to target_sparsity over warmup_steps."""
+        if step >= self.warmup_steps:
+            return self.target_sparsity
+        frac = step / self.warmup_steps
+        return self.target_sparsity * (1 - (1 - frac) ** 3)
+
+    @torch.no_grad()
+    def step(self, step: int):
+        """Called every training step. Only does work at update boundaries."""
+        if step % self.update_interval != 0:
+            # Just enforce masks every step (weights may have been updated by optimizer)
+            self._apply_masks()
+            return
+
+        current_sparsity = self._current_sparsity(step)
+        if current_sparsity <= 0:
+            return
+
+        for name, param in self.params:
+            mask = self.masks[name]
+            n_total = param.numel()
+            n_zeros_target = int(current_sparsity * n_total)
+
+            if step < self.warmup_steps:
+                # During warmup: simple magnitude pruning to reach current sparsity
+                magnitudes = param.abs()
+                if n_zeros_target > 0:
+                    threshold = torch.kthvalue(magnitudes.view(-1), n_zeros_target).values
+                    new_mask = magnitudes > threshold
+                    # Ensure we don't prune more than target
+                    if (~new_mask).sum() > n_zeros_target:
+                        new_mask = magnitudes >= threshold
+                    self.masks[name] = new_mask
+                    param.mul_(new_mask)
+            else:
+                # Post-warmup: prune-regrow cycle at fixed sparsity
+                n_active = mask.sum().item()
+                n_to_drop = int(self.drop_fraction * n_active)
+                if n_to_drop == 0:
+                    continue
+
+                # PRUNE: remove smallest-magnitude active weights
+                active_magnitudes = param.abs() * mask.float()
+                active_vals = active_magnitudes[mask]
+                if len(active_vals) <= n_to_drop:
+                    continue
+                drop_threshold = torch.kthvalue(active_vals, n_to_drop).values
+                prune_mask = (active_magnitudes <= drop_threshold) & mask
+                mask[prune_mask] = False
+
+                # REGROW: activate highest-gradient dormant weights
+                if param.grad is not None:
+                    dormant = ~mask
+                    grad_magnitudes = param.grad.abs() * dormant.float()
+                    n_dormant = dormant.sum().item()
+                    n_to_grow = min(n_to_drop, int(n_dormant))
+                    if n_to_grow > 0:
+                        grow_threshold = torch.kthvalue(
+                            grad_magnitudes[dormant],
+                            max(1, int(n_dormant) - n_to_grow)
+                        ).values
+                        grow_mask = (grad_magnitudes >= grow_threshold) & dormant
+                        mask[grow_mask] = True
+                        # Initialize regrown weights to zero (let optimizer fill them)
+                        param[grow_mask] = 0.0
+
+                self.masks[name] = mask
+                param.mul_(mask)
+
+    def _apply_masks(self):
+        """Zero out masked weights (call after optimizer.step)."""
+        for name, param in self.params:
+            param.data.mul_(self.masks[name])
+
+    def get_sparsity(self) -> float:
+        """Return current actual sparsity across all managed parameters."""
+        total = 0
+        zeros = 0
+        for name, param in self.params:
+            total += param.numel()
+            zeros += (~self.masks[name]).sum().item()
+        return zeros / total if total > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +344,7 @@ def train(
     use_ddp: bool = False,
     use_muon: bool = True,
     muon_wd: float = 0.02,
+    sparse_manager: SparseTopologyManager | None = None,
 ):
     """Main training loop with logging every eval_every steps."""
     model.train()
@@ -277,6 +400,10 @@ def train(
         loss.backward()
         optimizer.step()
 
+        # Apply sparse topology update (prune-regrow cycle)
+        if sparse_manager is not None:
+            sparse_manager.step(step)
+
         running_loss += loss.item()
 
         if (step + 1) % eval_every == 0:
@@ -294,7 +421,7 @@ def train(
                 pbar.set_postfix({"train": f"{train_loss:.3f}", "val": f"{val_loss:.3f}", "mfu": f"{mfu:.1%}"})
                 if use_wandb:
                     import wandb
-                    wandb.log({
+                    log_dict = {
                         "train/loss": train_loss,
                         "train/lr": lr,
                         "train/total_tokens": total_tokens,
@@ -304,7 +431,10 @@ def train(
                         "params/nonzero": nonzero_params,
                         "mfu": mfu,
                         "step": step + 1,
-                    })
+                    }
+                    if sparse_manager is not None:
+                        log_dict["sparsity/weight_sparsity"] = sparse_manager.get_sparsity()
+                    wandb.log(log_dict)
                 if val_loss < GOAL_VAL_LOSS:
                     print(f"\n  Goal achieved! val_loss={val_loss:.4f} < {GOAL_VAL_LOSS} with {nonzero_params:,} non-zero params")
 
@@ -360,6 +490,15 @@ def main():
                         help="Path to QA-augmented parquet directory for data mixing")
     parser.add_argument("--qa_ratio", type=float, default=0.1,
                         help="Fraction of QA samples when --qa_dir is set")
+    # Weight sparsity (RigL-style prune-regrow)
+    parser.add_argument("--weight_sparsity", type=float, default=0.0,
+                        help="Target weight sparsity (0 to disable)")
+    parser.add_argument("--sparsity_warmup", type=int, default=1000,
+                        help="Steps to ramp sparsity from 0 to target")
+    parser.add_argument("--prune_interval", type=int, default=100,
+                        help="Steps between prune-regrow cycles")
+    parser.add_argument("--drop_fraction", type=float, default=0.3,
+                        help="Fraction of active weights to prune/regrow each cycle")
     # Logging and tracking
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
@@ -476,6 +615,22 @@ def main():
     # Optimizer
     optimizer = setup_optimizer(model, args, use_ddp=use_ddp)
 
+    # Weight sparsity manager (operates on raw model params)
+    sparse_manager = None
+    if args.weight_sparsity > 0:
+        sparse_manager = SparseTopologyManager(
+            raw_model,
+            target_sparsity=args.weight_sparsity,
+            warmup_steps=args.sparsity_warmup,
+            update_interval=args.prune_interval,
+            drop_fraction=args.drop_fraction,
+        )
+        if is_main(use_ddp):
+            print(f"  Weight sparsity: target={args.weight_sparsity}, "
+                  f"warmup={args.sparsity_warmup}, interval={args.prune_interval}, "
+                  f"drop_fraction={args.drop_fraction}")
+            print(f"  Sparsity-managed params: {len(sparse_manager.params)} matrices")
+
     # Train
     model = train(
         model=model,
@@ -490,6 +645,7 @@ def main():
         use_ddp=use_ddp,
         use_muon=args.use_muon,
         muon_wd=args.muon_wd,
+        sparse_manager=sparse_manager,
     )
 
     # End-of-training summary

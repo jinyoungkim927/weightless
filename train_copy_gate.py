@@ -57,7 +57,12 @@ def main():
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
-    parser.add_argument("--d_ff", type=int, default=2048)
+    parser.add_argument("--d_ff", type=int, default=3072)
+    parser.add_argument("--ffn_type", type=str, default="relu2",
+                        choices=["swiglu", "relu2"])
+    parser.add_argument("--qk_norm", action="store_true", default=True)
+    parser.add_argument("--softcap", type=float, default=15.0)
+    parser.add_argument("--resid_scalars", action="store_true", default=True)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_steps", type=int, default=1000)
@@ -76,6 +81,10 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        ffn_type=args.ffn_type,
+        qk_norm=args.qk_norm,
+        softcap=args.softcap,
+        use_resid_scalars=args.resid_scalars,
     )
 
     # Load baseline weights (strict=False ignores missing copy_gate params)
