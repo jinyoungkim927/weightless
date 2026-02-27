@@ -132,7 +132,7 @@ pixi run torchrun --nproc_per_node=8 train.py \
 
 ### Context: Why This is a Rerun
 
-The original `everything_50M` scored 65% Story QA in your evaluation but Asher reported 25%. This rerun verifies reproducibility.
+The original `everything_50M` scored 65% Story QA but a separate evaluation reported 25%. This rerun verifies reproducibility.
 
 ### Token Budget Calculation
 
@@ -239,14 +239,14 @@ Results:
 - 10-example spot check: 6/10 (60%)
 - **100-sample benchmark: 69/100 = 69.0% Story QA accuracy**
 - Remarkably strong for only 50M tokens — nearly matches the 0.72B result (72%)
-- Confirms your original 65% result; **Asher's 25% is not reproducible**
+- Confirms the original 65% result; **the previously reported 25% is not reproducible**
 
 ---
 
 ## Reproducibility Note
 
-| Run | Your Original | Asher's Report | This Rerun |
+| Run | Original Result | Separate Report | This Rerun |
 |---|---|---|---|
 | everything_50M | 65% | 25% | **69%** |
 
-The rerun result (69%) is very close to your original (65%), with small variation expected from random seed differences in the 100-sample benchmark. Asher's 25% result likely came from a different evaluation setup, wrong model architecture flags, or a different checkpoint.
+The rerun result (69%) is very close to the original (65%), with small variation expected from random seed differences in the 100-sample benchmark. The previously reported 25% result likely came from a different evaluation setup, wrong model architecture flags, or a different checkpoint.

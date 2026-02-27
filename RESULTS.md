@@ -27,10 +27,10 @@
 - **Story QA accuracy**: 69% (100-sample benchmark, LLM judge)
 - **Checkpoint**: `checkpoints/everything_50M_rerun.pt` (364 MB)
 - **WandB**: https://wandb.ai/jinyoungkim927/weightless/runs/jf0s3p1l
-- **Note**: Rerun for reproducibility. Original recorded 65% (your result) vs Asher's 25%. This rerun yields 69%, confirming your original results replicate well.
+- **Note**: Rerun for reproducibility. Original recorded 65% vs a separate report of 25%. This rerun yields 69%, confirming the original results replicate well.
 
 ### everything_optimized_5500 (original) — previous run
-- **Story QA accuracy**: 63% (your record) / 25% (Asher's report)
+- **Story QA accuracy**: 63% (original) / 25% (separate report)
 - **Note**: Was single-GPU (0.09B tokens incorrectly), now corrected to 0.72B
 
 ### everything_50M (original) — previous run
