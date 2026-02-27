@@ -45,21 +45,17 @@ def load_passages(num_passages: int, seed: int = 42) -> list[str]:
 
 
 def generate_qa_pairs(passages: list[str], model: str = "claude-haiku-4-5-20251001",
-                      batch_size: int = 5) -> list[str]:
-    """Use Claude API to generate QA pairs from passages."""
+                      batch_size: int = 5, concurrency: int = 50) -> list[str]:
+    """Use Claude API to generate QA pairs from passages with async concurrency."""
+    import asyncio
     import anthropic
 
-    client = anthropic.Anthropic()
-    qa_texts = []
+    async def process_one(async_client, semaphore, idx, passage):
+        """Process a single passage with concurrency control."""
+        if len(passage) > 2000:
+            passage = passage[:2000]
 
-    for i in range(0, len(passages), batch_size):
-        batch = passages[i:i + batch_size]
-        for passage in batch:
-            # Truncate very long passages
-            if len(passage) > 2000:
-                passage = passage[:2000]
-
-            prompt = f"""Given this educational passage, generate 2-3 question-answer pairs that test understanding of the key concepts.
+        prompt = f"""Given this educational passage, generate 2-3 question-answer pairs that test understanding of the key concepts.
 
 Format each pair exactly as:
 Question: <question>
@@ -70,24 +66,40 @@ Passage:
 
 Generate the question-answer pairs:"""
 
+        async with semaphore:
             try:
-                response = client.messages.create(
+                response = await async_client.messages.create(
                     model=model,
                     max_tokens=512,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 qa_text = response.content[0].text.strip()
-
-                # Combine passage + QA into training text
-                combined = f"{passage}\n\n{qa_text}"
-                qa_texts.append(combined)
+                return f"{passage}\n\n{qa_text}"
             except Exception as e:
-                print(f"  Warning: API call failed: {e}")
-                continue
+                print(f"  Warning: API call failed for passage {idx}: {e}")
+                return None
 
-        print(f"  Generated QA for {min(i + batch_size, len(passages))}/{len(passages)} passages")
+    async def run_all():
+        async_client = anthropic.AsyncAnthropic()
+        semaphore = asyncio.Semaphore(concurrency)
+        done_count = 0
+        total = len(passages)
 
-    return qa_texts
+        tasks = [process_one(async_client, semaphore, i, p) for i, p in enumerate(passages)]
+
+        results = []
+        # Process in chunks to report progress
+        chunk_size = 100
+        for chunk_start in range(0, len(tasks), chunk_size):
+            chunk = tasks[chunk_start:chunk_start + chunk_size]
+            chunk_results = await asyncio.gather(*chunk)
+            results.extend(chunk_results)
+            done_count = min(chunk_start + chunk_size, total)
+            print(f"  Generated QA for {done_count}/{total} passages")
+
+        return [r for r in results if r is not None]
+
+    return asyncio.run(run_all())
 
 
 def tokenize_and_save(qa_texts: list[str], output_dir: str, max_seq_len: int = MAX_SEQ_LEN):
@@ -135,7 +147,9 @@ def main():
     parser.add_argument("--model", type=str, default="claude-haiku-4-5-20251001",
                         help="Claude model to use for QA generation")
     parser.add_argument("--batch_size", type=int, default=5,
-                        help="Number of passages per batch")
+                        help="Number of passages per batch (legacy, unused with async)")
+    parser.add_argument("--concurrency", type=int, default=50,
+                        help="Max concurrent API requests")
     parser.add_argument("--dry_run", action="store_true",
                         help="Only generate a few samples and print them")
     args = parser.parse_args()
@@ -150,7 +164,7 @@ def main():
         print(f"  {passages[0][:200]}...")
         print("\n  Generating QA pairs...")
 
-    qa_texts = generate_qa_pairs(passages, model=args.model, batch_size=args.batch_size)
+    qa_texts = generate_qa_pairs(passages, model=args.model, concurrency=args.concurrency)
     print(f"  Generated {len(qa_texts)} QA-augmented texts")
 
     if args.dry_run:
