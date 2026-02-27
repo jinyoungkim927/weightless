@@ -397,7 +397,7 @@ class CopyGateTransformer(SimpleTransformer):
         copy_probs.scatter_add_(
             2,
             input_ids.unsqueeze(1).expand(-1, T, -1),
-            copy_attn,
+            copy_attn.to(copy_probs.dtype),
         )
 
         # Blend generation and copy distributions
